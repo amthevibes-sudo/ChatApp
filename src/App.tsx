@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ApolloClient, InMemoryCache, createHttpLink, gql, useQuery, useMutation } from '@apollo/client';
 import { setContext } from '@apollo/client/link/context';
+import { onError as onErrorLink } from '@apollo/client/link/error';
+import { from } from '@apollo/client/link/core';
 import { 
   MessageCircle, 
   Send, 
@@ -104,7 +106,7 @@ interface AuthSession {
 }
 
 // Apollo Client Setup
-const createApolloClient = (accessToken: string | null) => {
+const createApolloClient = (accessToken: string | null, onTokenExpired?: () => void) => {
   const httpLink = createHttpLink({
     uri: NHOST_CONFIG.graphqlUrl,
   });
@@ -114,13 +116,32 @@ const createApolloClient = (accessToken: string | null) => {
       headers: {
         ...headers,
         authorization: accessToken ? `Bearer ${accessToken}` : "",
-        'x-hasura-admin-secret': '', // Add if needed
       }
     };
   });
 
+  const errorLink = onErrorLink(({ graphQLErrors, networkError, operation, forward }) => {
+    if (graphQLErrors) {
+      for (let err of graphQLErrors) {
+        if (err.extensions?.code === 'invalid-jwt' || err.message.includes('JWTExpired')) {
+          console.log('JWT expired, attempting refresh...');
+          if (onTokenExpired) {
+            onTokenExpired();
+          }
+        }
+      }
+    }
+    
+    if (networkError && 'statusCode' in networkError && networkError.statusCode === 401) {
+      console.log('Network 401 error, attempting refresh...');
+      if (onTokenExpired) {
+        onTokenExpired();
+      }
+    }
+  });
+
   return new ApolloClient({
-    link: authLink.concat(httpLink),
+    link: from([errorLink, authLink, httpLink]),
     cache: new InMemoryCache(),
     defaultOptions: {
       watchQuery: {
@@ -135,6 +156,38 @@ const createApolloClient = (accessToken: string | null) => {
 
 // Auth Service
 class AuthService {
+  static async refreshAccessToken(refreshToken: string): Promise<string | null> {
+    try {
+      const response = await fetch(`${NHOST_CONFIG.authUrl}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken })
+      });
+      
+      const result = await response.json();
+      if (result.session) {
+        const session = {
+          accessToken: result.session.accessToken,
+          refreshToken: result.session.refreshToken,
+          user: {
+            id: result.session.user.id,
+            email: result.session.user.email,
+            displayName: result.session.user.displayName,
+          },
+          expiresAt: Date.now() + (result.session.accessTokenExpiresIn * 1000),
+        };
+        localStorage.setItem('nhost_session', JSON.stringify(session));
+        return result.session.accessToken;
+      }
+      throw new Error('Token refresh failed');
+    } catch (error) {
+      console.error('Token refresh error:', error);
+      // Clear invalid session and redirect to login
+      localStorage.removeItem('nhost_session');
+      return null;
+    }
+  }
+
   static async signUp(email: string, password: string): Promise<{ user: User; session: AuthSession } | { error: string }> {
     try {
       const response = await fetch(`${NHOST_CONFIG.authUrl}/signup/email-password`, {
@@ -692,6 +745,7 @@ const App: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [initializing, setInitializing] = useState(true);
+  const [tokenRefreshing, setTokenRefreshing] = useState(false);
 
   // Initialize auth on app load
   useEffect(() => {
@@ -723,15 +777,42 @@ const App: React.FC = () => {
     initializeAuth();
   }, []);
 
+  const handleTokenExpired = async () => {
+    if (tokenRefreshing) return; // Prevent multiple refresh attempts
+    
+    setTokenRefreshing(true);
+    console.log('Token expired, attempting refresh...');
+    
+    const currentSession = AuthService.getStoredSession();
+    if (currentSession?.refreshToken) {
+      const newToken = await AuthService.refreshAccessToken(currentSession.refreshToken);
+      if (newToken) {
+        const updatedSession = AuthService.getStoredSession();
+        if (updatedSession) {
+          setSession(updatedSession);
+          setUser(updatedSession.user);
+          console.log('Token refreshed successfully');
+        }
+      } else {
+        console.log('Token refresh failed, signing out...');
+        handleSignOut();
+      }
+    } else {
+      console.log('No refresh token available, signing out...');
+      handleSignOut();
+    }
+    
+    setTokenRefreshing(false);
+  };
+
   // Setup Apollo Client when session changes
   useEffect(() => {
     if (session) {
-      const client = createApolloClient(session.accessToken);
+      const client = createApolloClient(session.accessToken, handleTokenExpired);
       setApolloClient(client);
     } else {
       setApolloClient(null);
     }
-  }, [session]);
 
   // Load chats when Apollo client is ready
   useEffect(() => {
@@ -774,6 +855,10 @@ const App: React.FC = () => {
       }
     } catch (error) {
       console.error('Error loading chats:', error);
+      // Check if it's an auth error
+      if (error.message?.includes('JWTExpired') || error.message?.includes('invalid-jwt')) {
+        await handleTokenExpired();
+      }
     }
   };
 
@@ -792,6 +877,10 @@ const App: React.FC = () => {
       }
     } catch (error) {
       console.error('Error loading messages:', error);
+      // Check if it's an auth error
+      if (error.message?.includes('JWTExpired') || error.message?.includes('invalid-jwt')) {
+        await handleTokenExpired();
+      }
     }
   };
 
@@ -811,6 +900,13 @@ const App: React.FC = () => {
 
   const handleCreateChat = async () => {
     if (!apolloClient) return;
+
+    // Check if token is about to expire
+    if (session && session.expiresAt - Date.now() < 120000) {
+      console.log('Token expiring soon, refreshing before creating chat...');
+      await handleTokenExpired();
+      return;
+    }
 
     try {
       const title = `New Chat - ${new Date().toLocaleString()}`;
@@ -833,6 +929,11 @@ const App: React.FC = () => {
       }
     } catch (error) {
       console.error('Error creating chat:', error);
+      // Check if it's an auth error
+      if (error.message?.includes('JWTExpired') || error.message?.includes('invalid-jwt')) {
+        await handleTokenExpired();
+        return;
+      }
       // Show user-friendly error
       alert('Failed to create new chat. Please try again.');
     }
@@ -840,6 +941,14 @@ const App: React.FC = () => {
 
   const handleSendMessage = async (content: string) => {
     if (!selectedChatId || !apolloClient || !session || !user) return;
+
+    // Check if token is about to expire (within 2 minutes)
+    const timeUntilExpiry = session.expiresAt - Date.now();
+    if (timeUntilExpiry < 120000) { // Less than 2 minutes
+      console.log('Token expiring soon, refreshing...');
+      await handleTokenExpired();
+      return; // Let the user retry after refresh
+    }
 
     setLoading(true);
 
@@ -881,6 +990,7 @@ const App: React.FC = () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session.accessToken}`,
         },
         body: JSON.stringify(webhookPayload),
       });
