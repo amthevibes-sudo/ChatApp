@@ -25,18 +25,25 @@ export const AuthForm: React.FC<AuthFormProps> = ({ onAuthSuccess }) => {
     try {
       if (isOtpStep) {
         // Verify OTP
-        const { error } = await nhost.auth.signIn({
+        const { error } = await nhost.auth.verifyEmail({
           email,
-          password,
-          options: {
-            otp
-          }
+          otp
         });
 
         if (error) {
           setError(error.message);
         } else {
-          onAuthSuccess();
+          // After email verification, sign in the user
+          const signInResult = await nhost.auth.signIn({
+            email,
+            password,
+          });
+          
+          if (signInResult.error) {
+            setError(signInResult.error.message);
+          } else {
+            onAuthSuccess();
+          }
         }
       } else if (isLogin) {
         // Login
