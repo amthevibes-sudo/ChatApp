@@ -23,6 +23,11 @@ export const AuthForm: React.FC<AuthFormProps> = ({ onAuthSuccess }) => {
     setIsLoading(true);
 
     try {
+      // Clear any existing session before signup
+      if (!isLogin && !isOtpStep) {
+        await nhost.auth.signOut();
+      }
+
       if (isOtpStep) {
         // Verify OTP
         const { error } = await nhost.auth.verifyEmail({
@@ -277,6 +282,12 @@ export const AuthForm: React.FC<AuthFormProps> = ({ onAuthSuccess }) => {
                 setError('');
                 setPassword('');
                 setConfirmPassword('');
+                setOtp('');
+                setIsOtpStep(false);
+                // Clear any existing session when switching modes
+                if (!isLogin) {
+                  nhost.auth.signOut();
+                }
               }}
               className="text-indigo-600 hover:text-indigo-500 text-sm"
             >

@@ -34,9 +34,16 @@ function App() {
             setIsAuthenticated(true);
             await loadChats();
           }
+        } else {
+          // Ensure clean state if no session
+          setUser(null);
+          setIsAuthenticated(false);
         }
       } catch (error) {
         console.error('Auth check failed:', error);
+        // Clear state on auth check failure
+        setUser(null);
+        setIsAuthenticated(false);
       } finally {
         setIsLoading(false);
       }
